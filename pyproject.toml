@@ -1,0 +1,33 @@
+[project]
+name = "codelab-fastapi-review"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "seyoung-commits", email = "buleming99@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.162.0",
+    "openai>=3.49.0",
+    "pydantic-settings>=2.16.2",
+]
+
+[project.scripts]
+codelab-fastapi-review = "codelab_fastapi_review:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.fastapi]
+entrypoint = "app.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

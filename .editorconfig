@@ -1,0 +1,41 @@
+# 편집기의 서식 규약을 저장소에 담아 두는 파일이다.
+# 개인 설정(User Settings)과 달리, 이 프로젝트를 여는 모든 사람에게 똑같이 적용된다.
+# 단, 편집기에 EditorConfig 확장이 설치되어 있어야 동작한다.
+
+# 여기서 탐색을 멈춘다. 상위 폴더의 .editorconfig를 더 찾지 않는다.
+root = true
+
+
+# [*] 아래 설정은 모든 파일에 적용된다.
+[*]
+
+# 문자 인코딩. 한글이 깨지지 않으려면 utf-8이어야 한다.
+charset = utf-8
+
+# 줄바꿈 문자를 LF로 통일한다. Windows 기본값은 CRLF라 그냥 두면 섞인다.
+end_of_line = lf
+
+# 파일 마지막에 빈 줄을 하나 넣는다. 없으면 git diff에 불필요한 변경이 잡힌다.
+insert_final_newline = true
+
+# 줄 끝에 남은 공백을 저장할 때 지운다.
+trim_trailing_whitespace = true
+
+
+# [*.py] 파이썬 파일. 들여쓰기 칸 수가 문법이므로 반드시 공백 4칸으로 맞춘다.
+[*.py]
+indent_style = space
+indent_size = 4
+
+
+# [*.{toml,json}] 설정 파일
+[*.{toml,json}]
+indent_style = space
+indent_size = 4
+
+
+# [*.md] 마크다운은 예외를 둔다.
+[*.md]
+
+# 마크다운에서는 줄 끝 공백 두 개가 줄바꿈을 뜻한다. 지우면 문서가 깨진다.
+trim_trailing_whitespace = false
