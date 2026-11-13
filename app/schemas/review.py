@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, StringConstraints
 
@@ -29,3 +29,5 @@ class ReviewReplyResponse(CamelModel):
     review_id: int
     reply: str
     model: str
+    tone: Literal["사과", "감사", "안내"]
+    needs_followup: bool

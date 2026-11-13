@@ -5,8 +5,11 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.exceptions import OutputParserException
 from openai import APIConnectionError
+from pydantic import ValidationError
 
+from app.clients.llm_client import ReplyDraft
 from app.core.config import Settings
 from app.dependencies import get_reply_chain
 from app.main import app
@@ -21,10 +24,10 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
         yield test_client
 
 
-def register_review(client: TestClient, rating: int = 2) -> dict:
+def register_review(client: TestClient, rating: int = 2, content: str = "비동기 예제가 너무 빨랐어요.") -> dict:
     response = client.post(
         "/api/reviews",
-        json={"studentName": "김수강", "rating": rating, "content": "비동기 예제가 너무 빨랐어요."},
+        json={"studentName": "김수강", "rating": rating, "content": content},
     )
     assert response.status_code == 201
     return response.json()
@@ -43,9 +46,27 @@ def test_generated_reply_is_saved_with_review(client: TestClient) -> None:
     assert body["model"] == "fake-llm"
     assert review["content"] in body["reply"]
     assert body["reply"].startswith("수업에서 불편을 드려 죄송합니다.")
+    assert body["tone"] == "사과"
+    assert body["needsFollowup"] is False
     fetched = client.get(path)
     assert fetched.status_code == 200
     assert fetched.json() == {**review, "replyDraft": body["reply"]}
+
+
+@pytest.mark.parametrize(
+    ("rating", "content", "tone", "needs_followup"),
+    [(5, "실습 설명이 이해하기 쉬웠어요.", "감사", False), (2, "수강료 환불을 요청합니다.", "사과", True)],
+)
+def test_generated_reply_metadata(
+    client: TestClient, rating: int, content: str, tone: str, needs_followup: bool
+) -> None:
+    review_id = register_review(client, rating, content)["reviewId"]
+
+    response = client.post(f"/api/reviews/{review_id}/reply")
+
+    assert response.status_code == 200
+    assert response.json()["tone"] == tone
+    assert response.json()["needsFollowup"] is needs_followup
 
 
 def test_reviews_can_be_filtered_by_rating(client: TestClient) -> None:
@@ -95,7 +116,10 @@ def test_editing_missing_review_returns_404(client: TestClient) -> None:
     assert response.json()["code"] == "REVIEW_NOT_FOUND"
 
 
-def test_llm_failure_keeps_existing_draft(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("failure", ["connection", "parsing", "validation"])
+def test_llm_failure_keeps_existing_draft(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     review_id = register_review(client)["reviewId"]
     path = f"/api/reviews/{review_id}"
     original = client.post(f"{path}/reply")
@@ -103,9 +127,16 @@ def test_llm_failure_keeps_existing_draft(client: TestClient, monkeypatch: pytes
     original_draft = original.json()["reply"]
 
     failing_chain = AsyncMock()
-    failing_chain.ainvoke.side_effect = APIConnectionError(
-        request=httpx.Request("POST", "https://api.openai.com/v1")
-    )
+    if failure == "connection":
+        failing_chain.ainvoke.side_effect = APIConnectionError(
+            request=httpx.Request("POST", "https://api.openai.com/v1")
+        )
+    elif failure == "parsing":
+        failing_chain.ainvoke.side_effect = OutputParserException("테스트용 출력 파싱 오류")
+    else:
+        with pytest.raises(ValidationError) as validation_error:
+            ReplyDraft.model_validate({"reply": "테스트 답글", "tone": "응원", "needs_followup": False})
+        failing_chain.ainvoke.side_effect = validation_error.value
     monkeypatch.setitem(app.dependency_overrides, get_reply_chain, lambda: failing_chain)
 
     response = client.post(f"{path}/reply")
