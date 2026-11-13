@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 from functools import partial
 from unittest.mock import AsyncMock
@@ -12,7 +13,13 @@ from pydantic import ValidationError
 from app.core.config import Settings
 from app.dependencies import get_reply_graph
 from app.main import app
-from app.services.reply_graph import REPLY_PROMPT, ReplyAssessment, build_reply_graph
+from app.services.reply_graph import (
+    REPLY_PROMPT,
+    FakeDraftChatModel,
+    ReplyAssessment,
+    build_draft_chain,
+    build_reply_graph,
+)
 
 
 @pytest.fixture
@@ -189,3 +196,57 @@ def test_reply_prompt_keeps_review_in_human_message() -> None:
     assert content not in system.content
     assert human.type == "human"
     assert human.content == f"별점: 2\n후기 본문: {content}"
+
+
+def read_sse(body: str) -> list[tuple[str, dict[str, str | int | bool]]]:
+    events = []
+    for frame in body.strip().split("\n\n"):
+        event_line, data_line = frame.splitlines()
+        assert event_line.startswith("event: ") and data_line.startswith("data: ")
+        events.append((event_line.removeprefix("event: "), json.loads(data_line.removeprefix("data: "))))
+    return events
+
+
+def test_reply_stream_sends_tokens_and_saves_final_reply(client: TestClient) -> None:
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+
+    response = client.post(f"{path}/reply/stream")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = read_sse(response.text)
+    assert events[0] == ("attempt", {"attempt": 1})
+    assert all(event == "token" for event, _ in events[1:-1])
+    assert len(events[1:-1]) >= 2
+    reply = "".join(data["text"] for _, data in events[1:-1])
+    assert events[-1] == ("done", {"reply": reply, "tone": "사과", "needsFollowup": False})
+    assert client.get(path).json()["replyDraft"] == reply
+
+
+def test_reply_stream_for_missing_review_returns_json_404(client: TestClient) -> None:
+    response = client.post("/api/reviews/99/reply/stream")
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "REVIEW_NOT_FOUND"
+
+
+def test_reply_stream_keeps_existing_draft_when_review_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    assert client.patch(f"{path}/reply", json={"replyDraft": "기존 초안"}).status_code == 200
+    reviewer = AsyncMock()
+    reviewer.ainvoke.side_effect = OutputParserException("테스트용 파싱 오류")
+    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer)
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
+
+    response = client.post(f"{path}/reply/stream")
+
+    assert response.status_code == 200
+    events = read_sse(response.text)
+    assert any(event == "token" for event, _ in events)
+    assert events[-1][0] == "error"
+    assert all(event != "done" for event, _ in events)
+    assert client.get(path).json()["replyDraft"] == "기존 초안"

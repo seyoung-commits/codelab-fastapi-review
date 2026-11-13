@@ -1,12 +1,17 @@
 import logging
-from typing import Literal, NotRequired, TypedDict
+import re
+from collections.abc import AsyncIterator
+from typing import Any, Literal, NotRequired, TypedDict
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
@@ -34,6 +39,9 @@ class ReplyState(ReplyInput):
     passed: NotRequired[bool]
     tone: NotRequired[ReplyTone]
     needs_followup: NotRequired[bool]
+
+
+ReplyGraph = CompiledStateGraph[ReplyState, None, ReplyInput, ReplyState]
 
 
 class ReplyAssessment(BaseModel):
@@ -76,7 +84,7 @@ REVIEW_PROMPT = ChatPromptTemplate.from_messages(
 
 async def _require_completed_response(message: BaseMessage) -> BaseMessage:
     status = message.response_metadata.get("status")
-    if status is not None and status != "completed":
+    if status != "completed":
         raise OutputParserException(INCOMPLETE_REPLY_MESSAGE)
     return message
 
@@ -97,17 +105,19 @@ async def _extract_assessment(
 
 def build_reply_graph(
     draft_chain: Runnable[DraftInput, str], review_chain: Runnable[ReplyState, ReplyAssessment]
-) -> CompiledStateGraph[ReplyState, None, ReplyInput, ReplyState]:
+) -> ReplyGraph:
     async def draft(state: ReplyState) -> dict[str, str | int]:
+        attempt = state.get("attempts", 0) + 1
+        get_stream_writer()({"attempt": attempt})
         draft_input: DraftInput = {"rating": state["rating"], "content": state["content"]}
-        if state.get("attempts", 0) > 0:
+        if attempt > 1:
             draft_input["revision_messages"] = [
                 HumanMessage(content=f"직전 답글: {state['reply']}\n검토 피드백: {state['feedback']}")
             ]
         reply = (await draft_chain.ainvoke(draft_input)).strip()
         if not reply:
             raise OutputParserException(INCOMPLETE_REPLY_MESSAGE)
-        return {"reply": reply, "attempts": state.get("attempts", 0) + 1}
+        return {"reply": reply, "attempts": attempt}
 
     async def review(state: ReplyState) -> dict[str, str | bool]:
         assessment = await review_chain.ainvoke(state)
@@ -139,22 +149,46 @@ def build_reply_graph(
     return graph.compile()
 
 
-def build_openai_reply_graph(llm: ChatOpenAI) -> CompiledStateGraph[ReplyState, None, ReplyInput, ReplyState]:
-    draft_chain = REPLY_PROMPT | llm | RunnableLambda(_require_completed_response) | StrOutputParser()
+def build_draft_chain(llm: BaseChatModel) -> Runnable[DraftInput, str]:
+    return REPLY_PROMPT | llm | RunnableLambda(_require_completed_response) | StrOutputParser()
+
+
+def build_openai_reply_graph(llm: ChatOpenAI) -> ReplyGraph:
     structured_llm = llm.with_structured_output(
-        ReplyAssessment, method="json_schema", strict=True, include_raw=True
+        ReplyAssessment, method="json_schema", strict=True, include_raw=True, stream=False
     )
     review_chain = REVIEW_PROMPT | structured_llm | RunnableLambda(_extract_assessment)
-    return build_reply_graph(draft_chain, review_chain)
+    return build_reply_graph(build_draft_chain(llm), review_chain)
 
 
-async def _fake_draft(review: DraftInput) -> str:
-    if review["rating"] <= 2:
-        opening = "수업에서 불편을 드려 죄송합니다."
-    else:
-        opening = "수강 후기를 남겨주셔서 감사합니다."
-    excerpt = review["content"][:80]
-    return f"{opening} 남겨주신 의견(‘{excerpt}’)을 수업 준비에 참고하겠습니다."
+class FakeDraftChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "fake-draft"
+
+    def _generate(self, messages: list[BaseMessage], **kwargs: Any) -> ChatResult:
+        raise NotImplementedError("가짜 답글 모델은 비동기 호출을 사용합니다.")
+
+    async def _agenerate(self, messages: list[BaseMessage], **kwargs: Any) -> ChatResult:
+        message = AIMessage(content=self._reply(messages), response_metadata={"status": "completed"})
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    async def _astream(self, messages: list[BaseMessage], **kwargs: Any) -> AsyncIterator[ChatGenerationChunk]:
+        for token in re.findall(r"\S+\s*", self._reply(messages)):
+            yield ChatGenerationChunk(message=AIMessageChunk(content=token))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content="", response_metadata={"status": "completed"}, chunk_position="last")
+        )
+
+    @staticmethod
+    def _reply(messages: list[BaseMessage]) -> str:
+        rating_line, _, content = messages[1].text.partition("\n후기 본문: ")
+        rating = int(rating_line.removeprefix("별점: "))
+        if rating <= 2:
+            opening = "수업에서 불편을 드려 죄송합니다."
+        else:
+            opening = "수강 후기를 남겨주셔서 감사합니다."
+        return f"{opening} 남겨주신 의견(‘{content[:80]}’)을 수업 준비에 참고하겠습니다."
 
 
 async def _fake_review(state: ReplyState) -> ReplyAssessment:
@@ -167,5 +201,5 @@ async def _fake_review(state: ReplyState) -> ReplyAssessment:
     )
 
 
-def build_fake_reply_graph() -> CompiledStateGraph[ReplyState, None, ReplyInput, ReplyState]:
-    return build_reply_graph(RunnableLambda(_fake_draft), RunnableLambda(_fake_review))
+def build_fake_reply_graph() -> ReplyGraph:
+    return build_reply_graph(build_draft_chain(FakeDraftChatModel()), RunnableLambda(_fake_review))

@@ -3,6 +3,7 @@ from threading import current_thread
 from typing import Annotated
 
 from fastapi import APIRouter, Query, status
+from fastapi.responses import StreamingResponse
 
 from app.dependencies import ReplyServiceDep, ReviewServiceDep
 from app.schemas.review import (
@@ -37,6 +38,21 @@ def get_review(review_id: int, service: ReviewServiceDep) -> ReviewResponse:
 async def create_reply(review_id: int, service: ReplyServiceDep) -> ReviewReplyResponse:
     logger.info("[후기 답글] reviewId=%s thread=%s", review_id, current_thread().name)
     return await service.create_reply(review_id)
+
+
+@router.post(
+    "/{review_id}/reply/stream",
+    summary="AI 강사 답글 초안 스트리밍",
+    response_class=StreamingResponse,
+    responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}},
+)
+async def stream_reply(review_id: int, service: ReplyServiceDep) -> StreamingResponse:
+    logger.info("[후기 답글 스트림] reviewId=%s thread=%s", review_id, current_thread().name)
+    return StreamingResponse(
+        service.stream_reply(review_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.patch("/{review_id}/reply", summary="강사 답글 초안 수정")
