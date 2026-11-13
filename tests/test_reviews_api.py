@@ -9,11 +9,10 @@ from langchain_core.exceptions import OutputParserException
 from openai import APIConnectionError
 from pydantic import ValidationError
 
-from app.clients.llm_client import ReplyDraft
 from app.core.config import Settings
-from app.dependencies import get_reply_chain
+from app.dependencies import get_reply_graph
 from app.main import app
-from app.services.reply_service import REPLY_PROMPT
+from app.services.reply_graph import REPLY_PROMPT, ReplyAssessment, build_reply_graph
 
 
 @pytest.fixture
@@ -126,25 +125,59 @@ def test_llm_failure_keeps_existing_draft(
     assert original.status_code == 200
     original_draft = original.json()["reply"]
 
-    failing_chain = AsyncMock()
+    failing_graph = AsyncMock()
     if failure == "connection":
-        failing_chain.ainvoke.side_effect = APIConnectionError(
+        failing_graph.ainvoke.side_effect = APIConnectionError(
             request=httpx.Request("POST", "https://api.openai.com/v1")
         )
     elif failure == "parsing":
-        failing_chain.ainvoke.side_effect = OutputParserException("테스트용 출력 파싱 오류")
+        failing_graph.ainvoke.side_effect = OutputParserException("테스트용 출력 파싱 오류")
     else:
         with pytest.raises(ValidationError) as validation_error:
-            ReplyDraft.model_validate({"reply": "테스트 답글", "tone": "응원", "needs_followup": False})
-        failing_chain.ainvoke.side_effect = validation_error.value
-    monkeypatch.setitem(app.dependency_overrides, get_reply_chain, lambda: failing_chain)
+            ReplyAssessment(passed=True, reason="테스트", tone="응원", needs_followup=False)
+        failing_graph.ainvoke.side_effect = validation_error.value
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: failing_graph)
 
     response = client.post(f"{path}/reply")
 
     assert response.status_code == 502
     assert response.json()["code"] == "AI_REQUEST_FAILED"
     assert client.get(path).json()["replyDraft"] == original_draft
-    failing_chain.ainvoke.assert_awaited_once()
+    failing_graph.ainvoke.assert_awaited_once()
+
+
+@pytest.mark.parametrize(("passed", "expected_attempts"), [(True, 1), (False, 2)])
+def test_reply_graph_stops_at_pass_or_attempt_limit(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, passed: bool, expected_attempts: int
+) -> None:
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    drafts = ["첫 답글 초안입니다.", "수정한 답글 초안입니다."]
+    feedback = "비동기 예제에 대한 의견을 구체적으로 언급하세요."
+    writer = AsyncMock()
+    writer.ainvoke.side_effect = drafts
+    reviewer = AsyncMock()
+    reviewer.ainvoke.return_value = ReplyAssessment(
+        passed=passed, reason=feedback, tone="사과", needs_followup=True
+    )
+    graph = build_reply_graph(writer, reviewer)
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
+
+    response = client.post(f"{path}/reply")
+
+    assert response.status_code == 200
+    assert writer.ainvoke.await_count == reviewer.ainvoke.await_count == expected_attempts
+    assert response.json() == {
+        "reviewId": review_id,
+        "reply": drafts[expected_attempts - 1],
+        "model": "fake-llm",
+        "tone": "사과",
+        "needsFollowup": True,
+    }
+    assert client.get(path).json()["replyDraft"] == drafts[expected_attempts - 1]
+    if not passed:
+        revision_input = writer.ainvoke.await_args_list[1].args[0]
+        assert revision_input["revision_messages"][0].content == f"직전 답글: {drafts[0]}\n검토 피드백: {feedback}"
 
 
 def test_reply_prompt_keeps_review_in_human_message() -> None:
