@@ -9,6 +9,7 @@ from app.dependencies import ReplyServiceDep, ReviewServiceDep
 from app.schemas.review import (
     ReviewCreateRequest,
     ReviewReplyResponse,
+    ReviewReplyReviseRequest,
     ReviewReplyUpdateRequest,
     ReviewResponse,
 )
@@ -53,6 +54,18 @@ async def stream_reply(review_id: int, service: ReplyServiceDep) -> StreamingRes
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post(
+    "/{review_id}/reply/revise",
+    summary="수정 지시로 AI 답글 다시 작성",
+    responses={404: {"description": "후기 없음"}, 409: {"description": "생성한 답글 없음"}, 502: {"description": "AI 요청 실패"}},
+)
+async def revise_reply(
+    review_id: int, request: ReviewReplyReviseRequest, service: ReplyServiceDep
+) -> ReviewReplyResponse:
+    logger.info("[후기 답글 수정] reviewId=%s thread=%s", review_id, current_thread().name)
+    return await service.revise_reply(review_id, request.instruction)
 
 
 @router.patch("/{review_id}/reply", summary="강사 답글 초안 수정")

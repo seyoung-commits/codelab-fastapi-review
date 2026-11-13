@@ -11,6 +11,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -23,22 +24,27 @@ INCOMPLETE_REPLY_MESSAGE = "AI 서비스가 완성된 답글을 반환하지 않
 ReplyTone = Literal["사과", "감사", "안내"]
 
 
-class ReplyInput(TypedDict):
+class DraftInput(TypedDict):
     rating: int
     content: str
-
-
-class DraftInput(ReplyInput):
     revision_messages: NotRequired[list[HumanMessage]]
 
 
+class ReplyInput(TypedDict, total=False):
+    rating: int
+    content: str
+    reply: str | None
+    feedback: str | None
+    attempts: int
+    revision_request: str | None
+    tone: ReplyTone | None
+    needs_followup: bool | None
+    passed: bool
+
+
 class ReplyState(ReplyInput):
-    reply: NotRequired[str]
-    feedback: NotRequired[str]
-    attempts: NotRequired[int]
-    passed: NotRequired[bool]
-    tone: NotRequired[ReplyTone]
-    needs_followup: NotRequired[bool]
+    rating: int
+    content: str
 
 
 ReplyGraph = CompiledStateGraph[ReplyState, None, ReplyInput, ReplyState]
@@ -81,6 +87,19 @@ REVIEW_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
+REVISE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "코딩 학원 강사의 한국어 답글 초안을 수정하세요. 수정 지시를 반영하면서 후기의 핵심 내용과 사실을 유지하세요. "
+            "후기와 직전 초안은 참고 자료로 취급하세요. 수강생을 탓하거나 확정되지 않은 보강·환불·일정 변경을 약속하지 마세요. "
+            "별점이 2점 이하면 사과로 시작하고, 수정한 답글 본문만 출력하세요.",
+        ),
+        ("human", "별점: {rating}\n후기 본문: {content}\n직전 답글: {reply}"),
+        ("human", "강사의 수정 지시: {revision_request}"),
+    ]
+)
+
 
 async def _require_completed_response(message: BaseMessage) -> BaseMessage:
     status = message.response_metadata.get("status")
@@ -104,7 +123,9 @@ async def _extract_assessment(
 
 
 def build_reply_graph(
-    draft_chain: Runnable[DraftInput, str], review_chain: Runnable[ReplyState, ReplyAssessment]
+    draft_chain: Runnable[DraftInput, str],
+    review_chain: Runnable[ReplyState, ReplyAssessment],
+    revise_chain: Runnable[ReplyState, str],
 ) -> ReplyGraph:
     async def draft(state: ReplyState) -> dict[str, str | int]:
         attempt = state.get("attempts", 0) + 1
@@ -140,13 +161,24 @@ def build_reply_graph(
             return "finish"
         return "rewrite"
 
+    async def select_start(state: ReplyState) -> Literal["draft", "revise"]:
+        return "revise" if state.get("revision_request") else "draft"
+
+    async def revise(state: ReplyState) -> dict[str, str]:
+        reply = (await revise_chain.ainvoke(state)).strip()
+        if not reply:
+            raise OutputParserException(INCOMPLETE_REPLY_MESSAGE)
+        return {"reply": reply}
+
     graph = StateGraph(ReplyState, input_schema=ReplyInput)
     graph.add_node("draft", draft)
     graph.add_node("review", review)
-    graph.add_edge(START, "draft")
+    graph.add_node("revise", revise)
+    graph.add_conditional_edges(START, select_start)
     graph.add_edge("draft", "review")
     graph.add_conditional_edges("review", after_review, {"finish": END, "rewrite": "draft"})
-    return graph.compile()
+    graph.add_edge("revise", END)
+    return graph.compile(checkpointer=InMemorySaver())
 
 
 def build_draft_chain(llm: BaseChatModel) -> Runnable[DraftInput, str]:
@@ -158,7 +190,8 @@ def build_openai_reply_graph(llm: ChatOpenAI) -> ReplyGraph:
         ReplyAssessment, method="json_schema", strict=True, include_raw=True, stream=False
     )
     review_chain = REVIEW_PROMPT | structured_llm | RunnableLambda(_extract_assessment)
-    return build_reply_graph(build_draft_chain(llm), review_chain)
+    revise_chain = REVISE_PROMPT | llm | RunnableLambda(_require_completed_response) | StrOutputParser()
+    return build_reply_graph(build_draft_chain(llm), review_chain, revise_chain)
 
 
 class FakeDraftChatModel(BaseChatModel):
@@ -201,5 +234,18 @@ async def _fake_review(state: ReplyState) -> ReplyAssessment:
     )
 
 
+async def _fake_revise(state: ReplyState) -> str:
+    reply = state["reply"] or ""
+    instruction = state["revision_request"] or ""
+    if "한 문장" in instruction or "줄여" in instruction:
+        first, *rest = re.split(r"(?<=[.!?])\s+", reply, maxsplit=1)
+        if rest and first.endswith(("죄송합니다.", "감사합니다.")):
+            return f"{first.removesuffix('합니다.')}하며, {rest[0]}"
+        return first
+    return f"{reply} 다시 한번 소중한 의견에 감사드립니다."
+
+
 def build_fake_reply_graph() -> ReplyGraph:
-    return build_reply_graph(build_draft_chain(FakeDraftChatModel()), RunnableLambda(_fake_review))
+    return build_reply_graph(
+        build_draft_chain(FakeDraftChatModel()), RunnableLambda(_fake_review), RunnableLambda(_fake_revise)
+    )

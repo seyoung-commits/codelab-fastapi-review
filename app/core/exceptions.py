@@ -12,6 +12,10 @@ class AiRequestError(Exception):
     pass
 
 
+class ReplyNotGeneratedError(Exception):
+    pass
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ReviewNotFoundError)
     async def handle_review_not_found(
@@ -27,4 +31,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=502,
             content={"code": "AI_REQUEST_FAILED", "detail": str(error)},
+        )
+
+    @app.exception_handler(ReplyNotGeneratedError)
+    async def handle_reply_not_generated(_request: Request, error: ReplyNotGeneratedError) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "REPLY_NOT_GENERATED", "detail": str(error)},
         )

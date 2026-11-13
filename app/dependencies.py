@@ -30,11 +30,12 @@ ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]
 
 
 def get_reply_service(
+    request: Request,
     review_service: ReviewServiceDep,
     reply_graph: Annotated[ReplyGraph, Depends(get_reply_graph)],
     model_name: Annotated[str, Depends(get_llm_model)],
 ) -> ReplyService:
-    return ReplyService(review_service, reply_graph, model_name)
+    return ReplyService(review_service, reply_graph, model_name, request.app.state.reply_locks)
 
 
 ReplyServiceDep = Annotated[ReplyService, Depends(get_reply_service)]

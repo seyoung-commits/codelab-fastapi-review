@@ -18,7 +18,7 @@ flowchart LR
 - **저장 기준** — AI 호출에 성공하면 새 초안을 저장합니다. 호출에 실패하면 `502`를 반환하고 기존 `replyDraft`를 유지합니다. [답글 서비스](app/services/reply_service.py)
 - **테스트 가능한 LLM 구성** — FastAPI lifespan에서 OpenAI 또는 가짜 LLM을 주입합니다. 테스트에서는 LLM 장애를 재현해 오류 응답과 기존 초안 보존을 함께 검증합니다. [앱 초기화](app/main.py) · [API 테스트](tests/test_reviews_api.py)
 
-후기와 초안은 인메모리 저장소에 보관되며 서버 재시작 시 초기화됩니다.
+후기와 초안은 인메모리 저장소에 보관됩니다. LangGraph의 `InMemorySaver`가 후기별 직전 답글을 기억하며, 자동 리로드를 포함한 서버 재시작 시 후기와 체크포인트가 함께 초기화됩니다.
 
 ## API
 
@@ -29,6 +29,7 @@ flowchart LR
 | `GET` | `/api/reviews/{review_id}` | `200` 후기와 `replyDraft` | `404` 후기 없음 |
 | `POST` | `/api/reviews/{review_id}/reply` | `200` 초안 생성·저장, `reviewId`·`reply`·`model` 반환 | `404` 후기 없음, `502` LLM 호출 실패 |
 | `PATCH` | `/api/reviews/{review_id}/reply` | `200` 초안이 수정된 후기 | `404` 후기 없음, `422` 빈 초안 |
+| `POST` | `/api/reviews/{review_id}/reply/revise` | `200` 수정 지시를 반영한 답글 | `404` 후기 없음, `409` 생성된 초안 없음, `422` 빈 지시, `502` LLM 호출 실패 |
 
 ### 요청 예시
 

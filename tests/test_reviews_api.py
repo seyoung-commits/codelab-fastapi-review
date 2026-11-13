@@ -167,7 +167,7 @@ def test_reply_graph_stops_at_pass_or_attempt_limit(
     reviewer.ainvoke.return_value = ReplyAssessment(
         passed=passed, reason=feedback, tone="사과", needs_followup=True
     )
-    graph = build_reply_graph(writer, reviewer)
+    graph = build_reply_graph(writer, reviewer, AsyncMock())
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
 
     response = client.post(f"{path}/reply")
@@ -239,7 +239,7 @@ def test_reply_stream_keeps_existing_draft_when_review_fails(
     assert client.patch(f"{path}/reply", json={"replyDraft": "기존 초안"}).status_code == 200
     reviewer = AsyncMock()
     reviewer.ainvoke.side_effect = OutputParserException("테스트용 파싱 오류")
-    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer)
+    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer, AsyncMock())
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
 
     response = client.post(f"{path}/reply/stream")
@@ -250,3 +250,80 @@ def test_reply_stream_keeps_existing_draft_when_review_fails(
     assert events[-1][0] == "error"
     assert all(event != "done" for event, _ in events)
     assert client.get(path).json()["replyDraft"] == "기존 초안"
+
+
+@pytest.mark.parametrize("generation_path", ["reply", "reply/stream"])
+def test_reply_can_be_revised_from_checkpoint(client: TestClient, generation_path: str) -> None:
+    review_id = register_review(client, content="수강료 환불을 요청합니다.")["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    assert client.post(f"{path}/{generation_path}").status_code == 200
+
+    response = client.post(f"{path}/reply/revise", json={"instruction": " 한 문장으로 줄여 줘 "})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "reviewId": review_id,
+        "model": "fake-llm",
+        "reply": "수업에서 불편을 드려 죄송하며, 남겨주신 의견(‘수강료 환불을 요청합니다.’)을 수업 준비에 참고하겠습니다.",
+        "tone": "사과",
+        "needsFollowup": True,
+    }
+    assert client.get(path).json()["replyDraft"] == response.json()["reply"]
+    regenerated = client.post(f"{path}/reply")
+    assert regenerated.status_code == 200
+    assert "수강료 환불을 요청합니다." in regenerated.json()["reply"]
+
+
+def test_reply_revise_requires_checkpoint_for_that_review(client: TestClient) -> None:
+    other_id = register_review(client)["reviewId"]
+    assert client.post(f"/api/reviews/{other_id}/reply").status_code == 200
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    assert client.patch(f"{path}/reply", json={"replyDraft": "직접 작성한 초안입니다."}).status_code == 200
+
+    response = client.post(f"{path}/reply/revise", json={"instruction": "한 문장으로 줄여 줘"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "REPLY_NOT_GENERATED"
+
+
+def test_reply_revision_uses_manually_edited_draft(client: TestClient) -> None:
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    assert client.post(f"{path}/reply").status_code == 200
+    edited = "다음 시간에 예제를 다시 설명하겠습니다. 상세 예제도 준비하겠습니다."
+    assert client.patch(f"{path}/reply", json={"replyDraft": edited}).status_code == 200
+
+    response = client.post(f"{path}/reply/revise", json={"instruction": "한 문장으로 줄여 줘"})
+
+    assert response.status_code == 200
+    assert response.json()["reply"] == "다음 시간에 예제를 다시 설명하겠습니다."
+    assert client.get(path).json()["replyDraft"] == response.json()["reply"]
+
+
+def test_reply_revision_rejects_blank_instruction(client: TestClient) -> None:
+    review_id = register_review(client)["reviewId"]
+    response = client.post(f"/api/reviews/{review_id}/reply/revise", json={"instruction": " \t "})
+    assert response.status_code == 422
+
+
+def test_failed_revision_keeps_previous_draft_available(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reviewer = AsyncMock()
+    reviewer.ainvoke.return_value = ReplyAssessment(passed=True, reason="통과", tone="사과", needs_followup=False)
+    reviser = AsyncMock()
+    reviser.ainvoke.side_effect = [OutputParserException("테스트용 수정 실패"), "수정된 초안입니다."]
+    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer, reviser)
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
+    review_id = register_review(client)["reviewId"]
+    path = f"/api/reviews/{review_id}"
+    original = client.post(f"{path}/reply").json()["reply"]
+    instruction = {"instruction": "한 문장으로 줄여 줘"}
+
+    failure = client.post(f"{path}/reply/revise", json=instruction)
+    assert failure.status_code == 502
+    assert client.get(path).json()["replyDraft"] == original
+    retry = client.post(f"{path}/reply/revise", json=instruction)
+    assert retry.status_code == 200
+    assert retry.json()["reply"] == "수정된 초안입니다."

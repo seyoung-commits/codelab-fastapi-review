@@ -25,6 +25,10 @@ class ReviewReplyUpdateRequest(CamelModel):
     reply_draft: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
+class ReviewReplyReviseRequest(CamelModel):
+    instruction: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class ReviewReplyResponse(CamelModel):
     review_id: int
     reply: str

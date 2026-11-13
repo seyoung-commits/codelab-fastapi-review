@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from weakref import WeakValueDictionary
 
 from fastapi import FastAPI
 
@@ -15,6 +16,7 @@ from app.services.reply_graph import build_fake_reply_graph, build_openai_reply_
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
     app.state.review_repository = ReviewRepository()
+    app.state.reply_locks = WeakValueDictionary()
 
     if settings.fake_llm or not settings.openai_api_key:
         app.state.reply_graph = build_fake_reply_graph()
