@@ -1,17 +1,22 @@
 from collections.abc import Iterator
+from functools import partial
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openai import APIConnectionError
 
-from app.core.exceptions import AiRequestError
-from app.dependencies import get_llm_client
+from app.core.config import Settings
+from app.dependencies import get_reply_chain
 from app.main import app
+from app.services.reply_service import REPLY_PROMPT
 
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("FAKE_LLM", "true")
+    monkeypatch.setattr("app.main.Settings", partial(Settings, _env_file=None))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -97,13 +102,26 @@ def test_llm_failure_keeps_existing_draft(client: TestClient, monkeypatch: pytes
     assert original.status_code == 200
     original_draft = original.json()["reply"]
 
-    failing_client = AsyncMock()
-    failing_client.generate_reply.side_effect = AiRequestError("테스트용 LLM 오류")
-    monkeypatch.setitem(app.dependency_overrides, get_llm_client, lambda: failing_client)
+    failing_chain = AsyncMock()
+    failing_chain.ainvoke.side_effect = APIConnectionError(
+        request=httpx.Request("POST", "https://api.openai.com/v1")
+    )
+    monkeypatch.setitem(app.dependency_overrides, get_reply_chain, lambda: failing_chain)
 
     response = client.post(f"{path}/reply")
 
     assert response.status_code == 502
     assert response.json()["code"] == "AI_REQUEST_FAILED"
     assert client.get(path).json()["replyDraft"] == original_draft
-    failing_client.generate_reply.assert_awaited_once()
+    failing_chain.ainvoke.assert_awaited_once()
+
+
+def test_reply_prompt_keeps_review_in_human_message() -> None:
+    content = "비동기 예제가 너무 빨랐어요."
+    system, human = REPLY_PROMPT.format_messages(rating=2, content=content)
+
+    assert system.type == "system"
+    assert "강사" in system.content
+    assert content not in system.content
+    assert human.type == "human"
+    assert human.content == f"별점: 2\n후기 본문: {content}"
