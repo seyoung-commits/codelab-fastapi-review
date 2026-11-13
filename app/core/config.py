@@ -13,4 +13,6 @@ class Settings(BaseSettings):
 
     openai_api_key: SecretStr | None = None
     openai_model: str = "gpt-5.4-mini"
+    openai_embedding_model: str = "text-embedding-3-small"
+    chroma_persist_directory: Path = Path(".chroma")
     fake_llm: bool = False

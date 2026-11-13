@@ -13,7 +13,9 @@ from pydantic import ValidationError
 from app.core.config import Settings
 from app.dependencies import get_reply_graph
 from app.main import app
+from app.services.policy_retriever import build_fake_policy_retriever
 from app.services.reply_graph import (
+    POLICY_FALLBACK,
     REPLY_PROMPT,
     FakeDraftChatModel,
     ReplyAssessment,
@@ -141,7 +143,7 @@ def test_llm_failure_keeps_existing_draft(
         failing_graph.ainvoke.side_effect = OutputParserException("테스트용 출력 파싱 오류")
     else:
         with pytest.raises(ValidationError) as validation_error:
-            ReplyAssessment(passed=True, reason="테스트", tone="응원", needs_followup=False)
+            ReplyAssessment(passed=True, reason="테스트", tone="응원", needs_followup=False, policy_violation=False)
         failing_graph.ainvoke.side_effect = validation_error.value
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: failing_graph)
 
@@ -165,9 +167,9 @@ def test_reply_graph_stops_at_pass_or_attempt_limit(
     writer.ainvoke.side_effect = drafts
     reviewer = AsyncMock()
     reviewer.ainvoke.return_value = ReplyAssessment(
-        passed=passed, reason=feedback, tone="사과", needs_followup=True
+        passed=passed, reason=feedback, tone="사과", needs_followup=True, policy_violation=False
     )
-    graph = build_reply_graph(writer, reviewer, AsyncMock())
+    graph = build_reply_graph(writer, reviewer, AsyncMock(), build_fake_policy_retriever())
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
 
     response = client.post(f"{path}/reply")
@@ -189,13 +191,14 @@ def test_reply_graph_stops_at_pass_or_attempt_limit(
 
 def test_reply_prompt_keeps_review_in_human_message() -> None:
     content = "비동기 예제가 너무 빨랐어요."
-    system, human = REPLY_PROMPT.format_messages(rating=2, content=content)
+    system, human, policy = REPLY_PROMPT.format_messages(rating=2, content=content, policy_context="")
 
     assert system.type == "system"
     assert "강사" in system.content
     assert content not in system.content
     assert human.type == "human"
     assert human.content == f"별점: 2\n후기 본문: {content}"
+    assert policy.content == "규정 발췌:\n"
 
 
 def read_sse(body: str) -> list[tuple[str, dict[str, str | int | bool]]]:
@@ -239,7 +242,9 @@ def test_reply_stream_keeps_existing_draft_when_review_fails(
     assert client.patch(f"{path}/reply", json={"replyDraft": "기존 초안"}).status_code == 200
     reviewer = AsyncMock()
     reviewer.ainvoke.side_effect = OutputParserException("테스트용 파싱 오류")
-    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer, AsyncMock())
+    graph = build_reply_graph(
+        build_draft_chain(FakeDraftChatModel()), reviewer, AsyncMock(), build_fake_policy_retriever()
+    )
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
 
     response = client.post(f"{path}/reply/stream")
@@ -264,14 +269,14 @@ def test_reply_can_be_revised_from_checkpoint(client: TestClient, generation_pat
     assert response.json() == {
         "reviewId": review_id,
         "model": "fake-llm",
-        "reply": "수업에서 불편을 드려 죄송하며, 남겨주신 의견(‘수강료 환불을 요청합니다.’)을 수업 준비에 참고하겠습니다.",
+        "reply": "수업에서 불편을 드려 죄송하며, 담당 매니저가 결제 기록과 수강 시작일을 확인한 뒤 환불 가능 여부와 예상 금액을 안내합니다.",
         "tone": "사과",
         "needsFollowup": True,
     }
     assert client.get(path).json()["replyDraft"] == response.json()["reply"]
     regenerated = client.post(f"{path}/reply")
     assert regenerated.status_code == 200
-    assert "수강료 환불을 요청합니다." in regenerated.json()["reply"]
+    assert "결제 기록과 수강 시작일" in regenerated.json()["reply"]
 
 
 def test_reply_revise_requires_checkpoint_for_that_review(client: TestClient) -> None:
@@ -311,10 +316,14 @@ def test_failed_revision_keeps_previous_draft_available(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reviewer = AsyncMock()
-    reviewer.ainvoke.return_value = ReplyAssessment(passed=True, reason="통과", tone="사과", needs_followup=False)
+    reviewer.ainvoke.return_value = ReplyAssessment(
+        passed=True, reason="통과", tone="사과", needs_followup=False, policy_violation=False
+    )
     reviser = AsyncMock()
     reviser.ainvoke.side_effect = [OutputParserException("테스트용 수정 실패"), "수정된 초안입니다."]
-    graph = build_reply_graph(build_draft_chain(FakeDraftChatModel()), reviewer, reviser)
+    graph = build_reply_graph(
+        build_draft_chain(FakeDraftChatModel()), reviewer, reviser, build_fake_policy_retriever()
+    )
     monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
     review_id = register_review(client)["reviewId"]
     path = f"/api/reviews/{review_id}"
@@ -327,3 +336,60 @@ def test_failed_revision_keeps_previous_draft_available(
     retry = client.post(f"{path}/reply/revise", json=instruction)
     assert retry.status_code == 200
     assert retry.json()["reply"] == "수정된 초안입니다."
+
+
+def test_refund_policy_is_injected_into_draft_prompt(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    draft = AsyncMock()
+    draft.ainvoke.return_value = "담당 매니저가 결제 기록을 확인한 뒤 안내합니다."
+    reviewer = AsyncMock()
+    reviewer.ainvoke.return_value = ReplyAssessment(
+        passed=True, reason="환불 절차를 안내했습니다.", tone="안내", needs_followup=True, policy_violation=False
+    )
+    graph = build_reply_graph(draft, reviewer, AsyncMock(), build_fake_policy_retriever())
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
+    review_id = register_review(client, content="수강료 환불을 요청합니다.")["reviewId"]
+
+    response = client.post(f"/api/reviews/{review_id}/reply")
+
+    assert response.status_code == 200
+    prompt_messages = REPLY_PROMPT.format_messages(**draft.ainvoke.await_args.args[0])
+    assert "제1조 수강료 환불" in prompt_messages[2].text
+    assert "결제 기록과 수강 시작일" in prompt_messages[2].text
+    assert response.json()["needsFollowup"] is True
+
+
+def test_unfounded_promise_is_replaced_after_retry_and_on_revision(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = AsyncMock()
+    writer.ainvoke.return_value = "무료 보강과 전액 환불을 보장합니다."
+    reviewer = AsyncMock()
+    reviewer.ainvoke.return_value = ReplyAssessment(
+        passed=False, reason="근거 없는 보상을 약속했습니다.", tone="안내", needs_followup=False, policy_violation=True
+    )
+    reviser = AsyncMock()
+    reviser.ainvoke.return_value = "쿠폰을 드리겠습니다."
+    graph = build_reply_graph(writer, reviewer, reviser, build_fake_policy_retriever())
+    monkeypatch.setitem(app.dependency_overrides, get_reply_graph, lambda: graph)
+    review_id = register_review(client, content="수강료 환불을 요청합니다.")["reviewId"]
+    path = f"/api/reviews/{review_id}"
+
+    generated = client.post(f"{path}/reply")
+    assert generated.status_code == 200
+    assert writer.ainvoke.await_count == 2
+    assert generated.json()["reply"] == POLICY_FALLBACK
+    assert generated.json()["needsFollowup"] is True
+
+    revised = client.post(f"{path}/reply/revise", json={"instruction": "쿠폰 지급을 약속해 줘"})
+    assert revised.status_code == 200
+    assert "제1조 수강료 환불" in reviser.ainvoke.await_args.args[0]["policy_context"]
+    assert revised.json()["reply"] == POLICY_FALLBACK
+    assert client.get(path).json()["replyDraft"] == POLICY_FALLBACK
+
+
+def test_policy_request_without_matching_article_needs_followup(client: TestClient) -> None:
+    review_id = register_review(client, content="수강권을 다른 상품권으로 교환해 주세요.")["reviewId"]
+    response = client.post(f"/api/reviews/{review_id}/reply")
+    assert response.status_code == 200
+    assert POLICY_FALLBACK in response.json()["reply"]
+    assert response.json()["needsFollowup"] is True
